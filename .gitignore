@@ -49,3 +49,7 @@ logs/
 # Misc
 *.bak
 *.tmp
+
+# Project-specific temporary files
+# temp.md: local instruction notes, keep out of VCS
+temp.md
