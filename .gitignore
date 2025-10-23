@@ -1,0 +1,51 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build outputs
+/dist/
+/build/
+/coverage/
+.cache/
+.parcel-cache/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editors and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.pdb
+*.egg-info/
+.eggs/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.venv/
+venv/
+pip-log.txt
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Misc
+*.bak
+*.tmp
