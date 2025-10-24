@@ -1,55 +1,25 @@
 # Node
 node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# Build outputs
-/dist/
-/build/
-/coverage/
-.cache/
-.parcel-cache/
-
-# Environment files
-.env
-.env.*
-!.env.example
-
-# Editors and OS files
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-.idea/
-.vscode/
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
+playwright-report/
+playwright/.cache/
 
 # Python
 __pycache__/
-*.py[cod]
-*.pyd
+*.pyc
 *.pyo
-*.pdb
-*.egg-info/
-.eggs/
-.python-version
-.pytest_cache/
-.mypy_cache/
-.pytype/
+*.pyd
 .venv/
-venv/
-pip-log.txt
+.env
+.env.*
 
-# Logs
-logs/
+# OS/Editor
+.DS_Store
+Thumbs.db
 *.log
-*.log.*
 
-# Misc
-*.bak
-*.tmp
-
-# Project-specific temporary files
-# temp.md: local instruction notes, keep out of VCS
-temp.md
+# Project files not for VCS
+duckcoding_ack.txt
+status_watcher_state.json

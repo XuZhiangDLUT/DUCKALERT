@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"No tests yet\"",
+    "fetch:tokens": "node scripts/fetch_benefit_tokens.js",
+    "query:details": "node scripts/query_details_from_site.js",
+    "query:remain": "node scripts/query_remaining_from_site.js"
   },
   "keywords": [],
   "author": "",
@@ -16,5 +19,8 @@
   "dependencies": {
     "playwright": "^1.56.1",
     "playwright-core": "^1.56.1"
+  },
+  "bin": {
+    "dc-status-fetch": "scripts/fetch_status_services.js"
   }
 }
