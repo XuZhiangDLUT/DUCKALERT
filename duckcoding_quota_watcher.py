@@ -108,6 +108,15 @@ except Exception:
 # Default to Windows toast notifications (non-blocking). Fallback to MessageBox if needed.
 USE_TOAST_BY_DEFAULT = True
 
+# HTML Dashboard (Plotly JS) settings
+# When set via --html, the watcher will continuously write/update an HTML file
+# containing a Plotly-based line chart showing three benefit balances over time.
+HTML_OUTPUT_PATH: Optional[Path] = None
+_MAX_HISTORY_POINTS: int = 14400  # keep roughly 12 hours at 60s interval
+_HISTORY_T: List[float] = []  # epoch seconds per sample
+_HISTORY_SERIES: Dict[str, List[float]] = {}  # label -> series of remaining_yen
+
+
 _money_re = re.compile(r"[-+]?(?:\d+(?:,\d{3})*|\d+)(?:\.\d+)?")
 
 
@@ -707,6 +716,167 @@ def _print_quota_snapshot(details_map: Dict[str, QuotaDetails], order: List[str]
     _safe_print("-" * max(40, len(header)))
 
 
+# ---------- HTML dashboard (Plotly JS) ----------
+
+def _ensure_history_keys(order: List[str]) -> None:
+    for label in order:
+        if label not in _HISTORY_SERIES:
+            _HISTORY_SERIES[label] = []
+
+
+def _append_history(order: List[str], details_map: Dict[str, QuotaDetails]) -> None:
+    """Append current snapshot into in-memory history and keep arrays aligned/trimmed."""
+    _ensure_history_keys(order)
+    _HISTORY_T.append(time.time())
+    for label in order:
+        q = details_map.get(label, QuotaDetails())
+        try:
+            val = float(q.remaining_yen or 0.0)
+        except Exception:
+            val = 0.0
+        _HISTORY_SERIES[label].append(val)
+
+    # Trim to max points (drop oldest across all arrays to keep aligned)
+    if len(_HISTORY_T) > _MAX_HISTORY_POINTS:
+        drop = len(_HISTORY_T) - _MAX_HISTORY_POINTS
+        if drop > 0:
+            del _HISTORY_T[:drop]
+            for label in list(_HISTORY_SERIES.keys()):
+                if len(_HISTORY_SERIES[label]) > drop:
+                    del _HISTORY_SERIES[label][:drop]
+                else:
+                    _HISTORY_SERIES[label].clear()
+
+
+def _render_plot_html(order: List[str]) -> str:
+    """Return a standalone HTML string with a Plotly line chart.
+    Uses Plotly JS from a public CDN so no extra Python deps are required.
+    """
+    ts_ms = [int(t * 1000) for t in _HISTORY_T]
+    series_js = {}
+    for label in order:
+        series_js[label] = _HISTORY_SERIES.get(label, [])
+
+    # Use JSON dumps for safe embedding
+    ts_json = json.dumps(ts_ms, ensure_ascii=False)
+    data_json = json.dumps(series_js, ensure_ascii=False)
+
+    last_ts = 0
+    try:
+        last_ts = int(_HISTORY_T[-1]) if _HISTORY_T else 0
+    except Exception:
+        last_ts = 0
+
+    html = f"""
+<!doctype html>
+<html lang=\"zh-CN\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>DuckCoding 福利余额（实时）</title>
+  <script src=\"https://cdn.plot.ly/plotly-2.29.1.min.js\"></script>
+  <style>
+    html, body {{ margin:0; padding:0; height:100%; font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, \"Microsoft Yahei\", sans-serif; }}
+    #wrap {{ display:flex; flex-direction:column; height:100%; }}
+    header {{ padding:8px 12px; border-bottom:1px solid #eee; background:#fafafa; }}
+    #chart {{ flex:1 1 auto; }}
+    .muted {{ color:#666; font-size:12px; }}
+  </style>
+</head>
+<body>
+  <div id=\"wrap\">
+    <header>
+      <div><strong>DuckCoding 福利余额（实时）</strong></div>
+      <div class=\"muted\">建议配合 VS Code Live Preview/Live Server 打开本文件，保存或脚本写入时会自动刷新</div>
+      <div id=\"last\" class=\"muted\"></div>
+    </header>
+    <div id=\"chart\"></div>
+  </div>
+
+  <script>
+    const ts = {ts_json};
+    const seriesMap = {data_json};
+
+    function fmtTs(s) {{
+      if (!s) return '—';
+      const d = new Date(s*1000);
+      const pad = (n) => String(n).padStart(2,'0');
+      return `${{d.getFullYear()}}-${{pad(d.getMonth()+1)}}-${{pad(d.getDate())}} ${{pad(d.getHours())}}:${{pad(d.getMinutes())}}:${{pad(d.getSeconds())}}`;
+    }}
+
+    function buildTraces() {{
+      const names = ['Claude Code 专用福利', 'CodeX 专用福利', 'Gemini CLI 专用福利'];
+      const colors = {{
+        'Claude Code 专用福利': '#1f77b4',
+        'CodeX 专用福利': '#d62728',
+        'Gemini CLI 专用福利': '#2ca02c'
+      }};
+      const traces = [];
+      for (const name of names) {{
+        const y = seriesMap[name] || [];
+        traces.push({{
+          name,
+          x: ts.map(t => new Date(t)),
+          y,
+          mode: 'lines+markers',
+          line: {{ width: 2, color: colors[name] || undefined }},
+          marker: {{ size: 4 }}
+        }});
+      }}
+      return traces;
+    }}
+
+    function render() {{
+      const traces = buildTraces();
+      const layout = {{
+        margin: {{ t: 40, r: 20, b: 40, l: 50 }},
+        legend: {{ orientation: 'h', y: -0.2 }},
+        xaxis: {{ title: '时间' }},
+        yaxis: {{ title: '余额 (¥)' }},
+        title: 'DuckCoding 福利余额（实时）'
+      }};
+      Plotly.newPlot('chart', traces, layout, {{ responsive: true, displaylogo: false }});
+      const lastTs = ts.length ? Math.floor(ts[ts.length-1]/1000) : 0;
+      const lastDiv = document.getElementById('last');
+      lastDiv.textContent = '最后更新时间：' + fmtTs(lastTs);
+    }}
+
+    render();
+  </script>
+</body>
+</html>
+"""
+    return html
+
+
+def _write_html_atomic(path: Path, content: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(content, encoding='utf-8')
+        os.replace(str(tmp), str(path))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+
+def _update_html_dashboard(order: List[str]) -> None:
+    if not HTML_OUTPUT_PATH:
+        return
+    try:
+        html = _render_plot_html(order)
+        _write_html_atomic(Path(HTML_OUTPUT_PATH), html)
+    except Exception as e:
+        print("[DuckCoding] HTML 写入失败:", e)
+
+
 def _print_details(label: str, q: QuotaDetails) -> None:
     # Backward-compat single-line printer (unused in snapshot)
     used_pct_str = f"{q.used_percent:.1f}%" if q.used_percent > 0 else "—"
@@ -803,6 +973,14 @@ def main() -> None:
             # Pretty snapshot
             _print_quota_snapshot(details_map, order, stale=stale_map, missing=missing_map)
 
+            # Update HTML dashboard (if enabled)
+            if HTML_OUTPUT_PATH:
+                try:
+                    _append_history(order, details_map)
+                    _update_html_dashboard(order)
+                except Exception as e:
+                    print("[DuckCoding] HTML 写入失败:", e)
+
             codex_remaining = details_map["CodeX 专用福利"].remaining_yen
 
             # Trailing separator (optional): keep minimal; header already segments rounds
@@ -887,11 +1065,21 @@ if __name__ == "__main__":
     parser.add_argument("--force-messagebox", action="store_true", help="Force using MessageBox instead of toast for notifications")
     parser.add_argument("--once", action="store_true", help="Run a single check and exit (will notify if over threshold)")
     parser.add_argument("--force-toast", action="store_true", help="Force using win10toast notifications (may cause console noise on some hosts)")
+    parser.add_argument("--html", type=str, help="Write/update a Plotly HTML dashboard at this path (open with VS Code Live Preview/Live Server)")
     args = parser.parse_args()
 
     # Set runtime toggle for notification backend
     FORCE_MESSAGEBOX = bool(args.force_messagebox)
     FORCE_TOAST = bool(args.force_toast)
+
+    # Enable HTML dashboard if requested
+    if getattr(args, 'html', None):
+        try:
+            HTML_OUTPUT_PATH = Path(args.html).resolve()
+            print(f"[DuckCoding] HTML dashboard enabled: {HTML_OUTPUT_PATH}")
+        except Exception:
+            HTML_OUTPUT_PATH = Path(args.html)
+            print(f"[DuckCoding] HTML dashboard enabled: {HTML_OUTPUT_PATH}")
 
     if args.test_notify:
         _notify("DuckCoding 测试通知", "这是声音与弹窗测试 (带提示音)")
@@ -948,6 +1136,14 @@ if __name__ == "__main__":
                     _remember_good("CodeX 专用福利", qx)
 
             _print_quota_snapshot(details_map, order, stale=stale_map, missing=missing_map)
+
+            # Update HTML once if enabled
+            if HTML_OUTPUT_PATH:
+                try:
+                    _append_history(order, details_map)
+                    _update_html_dashboard(order)
+                except Exception as e:
+                    print("[DuckCoding] HTML 写入失败:", e)
 
             remaining = float(details_map["CodeX 专用福利"].remaining_yen or 0.0)
             ack = _read_ack_flag()

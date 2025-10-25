@@ -4,7 +4,7 @@
 - 额度监控：`duckcoding_quota_watcher.py`
 - 状态监控：`duckcoding_status_watcher.py`
 
-两者均以命令行方式运行，依赖 Node + Playwright 的辅助脚本（位于 `scripts/`）。额度脚本支持阶段化提醒（A/B），状态脚本支持下行/上行阈值提醒，并对抓取偶发失败做了“最后一次有效数据”回退与判定防抖，实际使用更加稳定。
+两者均以命令行方式运行，依赖 Node + Playwright 的辅助脚本（位于 `scripts/`）。额度脚本支持阶段化提醒（A/B），状态脚本支持下行/上行阈值提醒，并对抓取偶发失败做了“最后一次有效数据”回退与判定防抖，实际使用更加稳定。另新增：可持续生成 Plotly HTML 仪表盘，配合 VS Code Live Preview/Live Server 在标签页里自动刷新查看三条余额曲线。
 
 ---
 
@@ -74,6 +74,15 @@ pythonw "<项目根目录>\\duckcoding_quota_watcher.py"
 ```powershell
 python duckcoding_quota_watcher.py --once
 ```
+- 额度：HTML 实时预览（Plotly）
+  1) 在 VS Code 安装并启用 “Live Preview” 或 “Live Server” 插件（任一即可）
+  2) 运行脚本并指定输出 HTML 路径（脚本每轮写入会触发自动刷新）：
+```powershell
+python duckcoding_quota_watcher.py --html duckcoding_dashboard.html
+```
+  3) 在 VS Code 里打开该 HTML，使用 Live Preview/Live Server 打开为标签页。页面会随文件更新而刷新，显示三条曲线：
+     - `Claude Code 专用福利`、`CodeX 专用福利`、`Gemini CLI 专用福利` 的剩余额度（¥）
+  说明：HTML 内部引用 Plotly JS CDN（cdn.plot.ly），若有网络/代理限制，请配置系统/VS Code 代理。
 - 强制使用消息框（阻塞式）：
 ```powershell
 python duckcoding_quota_watcher.py --force-messagebox
@@ -126,6 +135,16 @@ Set-Content -Path duckcoding_ack.txt -Value 1 -NoNewline
 # 手动回到阶段A：
 Set-Content -Path duckcoding_ack.txt -Value 0 -NoNewline
 ```
+
+---
+
+## HTML 仪表盘说明（额度）
+- 启用方式：`--html <输出路径>`（例如 `duckcoding_dashboard.html`）
+- 数据来源：每轮抓取快照后，追加到内存历史并写入单一 HTML 文件
+- 可视化：单图三线（Claude/Codex/Gemini 的“剩余额度 ¥”），带时间轴；页头显示“最后更新时间”
+- 自动刷新：依赖 VS Code Live Preview/Live Server 对文件变更的自动重载；无需 meta refresh
+- 历史长度：保留最近约 720 个点（默认 60s 间隔 ≈ 12 小时），可在源码 `_MAX_HISTORY_POINTS` 调整
+- 依赖：不需要额外 Python 包；HTML 依赖 Plotly JS CDN（`https://cdn.plot.ly/plotly-2.29.1.min.js`）
 
 ---
 
