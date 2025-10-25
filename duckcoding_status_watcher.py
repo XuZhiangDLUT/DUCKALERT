@@ -45,6 +45,10 @@ try:
 except Exception:
     _toaster = None
 
+# In-memory last-good cache to mask transient page/API noise
+_LAST_GOOD_SERVICES: Dict[str, Tuple[float, float]] = {}
+_LAST_GOOD_TTL_SEC: float = 10 * 60  # 10 minutes
+
 # Config
 STATUS_URL = "https://status.duckcoding.com/status/duckcoding"
 POLL_INTERVAL_SEC = 300  # 5 minutes
@@ -52,12 +56,46 @@ DOWN_THRESHOLDS_DEFAULT = [70.0, 60.0, 50.0, 30.0, 10.0]
 UP_THRESHOLDS_DEFAULT = [80.0]
 WATCH_DEFAULT = ["日本线路（CodeX）", "日本线路（Claude Code）"]
 
+# Node fetch retry/backoff
+STATUS_NODE_TIMEOUT_SEC = 75  # single attempt timeout (was 60)
+STATUS_FETCH_RETRIES = 2      # extra attempts after the first
+STATUS_FETCH_RETRY_DELAY_SEC = 2  # base delay; backoff = delay * (attempt_index+1)
+
 # Paths
 ROOT = Path(__file__).parent
 NODE_SCRIPT = ROOT / "scripts" / "fetch_status_services.js"
 STATE_FILE = ROOT / "status_watcher_state.json"
 
 _percent_re = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+def _is_plausible_percent(p: float) -> bool:
+    try:
+        p = float(p)
+        return (0.0 <= p <= 100.0)
+    except Exception:
+        return False
+
+
+def _remember_good_pct(name: str, p: float) -> None:
+    try:
+        if _is_plausible_percent(p):
+            _LAST_GOOD_SERVICES[name] = (float(p), time.time())
+    except Exception:
+        pass
+
+
+def _get_last_good_pct(name: str, max_age_sec: float | None = None) -> Optional[float]:
+    try:
+        if name not in _LAST_GOOD_SERVICES:
+            return None
+        val, ts = _LAST_GOOD_SERVICES.get(name, (None, 0.0))  # type: ignore
+        ttl = _LAST_GOOD_TTL_SEC if max_age_sec is None else float(max_age_sec)
+        if val is not None and (time.time() - float(ts)) <= ttl and _is_plausible_percent(val):
+            return float(val)
+        return None
+    except Exception:
+        return None
 
 
 def _beep() -> None:
@@ -90,22 +128,39 @@ def _notify(title: str, msg: str) -> None:
 def _run_node_fetch() -> List[Dict[str, float]]:
     if not NODE_SCRIPT.exists():
         raise RuntimeError(f"Node script not found: {NODE_SCRIPT}")
-    out = subprocess.check_output(
-        ["node", str(NODE_SCRIPT)],
-        text=True,
-        encoding='utf-8',
-        errors='ignore',
-        stderr=subprocess.STDOUT,
-        timeout=60,
-        cwd=str(ROOT),
-    )
-    try:
-        data = json.loads(out)
-        if isinstance(data, list):
-            return data  # [{name, percent_24h}]
-    except Exception as e:
-        raise RuntimeError(f"Invalid JSON from Node: {e}\nRaw: {out[:200]}...")
-    return []
+
+    last_err = None
+    for attempt in range(1 + int(STATUS_FETCH_RETRIES)):
+        try:
+            out = subprocess.check_output(
+                ["node", str(NODE_SCRIPT)],
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                stderr=subprocess.STDOUT,
+                timeout=int(STATUS_NODE_TIMEOUT_SEC),
+                cwd=str(ROOT),
+            )
+            try:
+                data = json.loads(out)
+                if isinstance(data, list):
+                    return data  # [{name, percent_24h}]
+                else:
+                    raise RuntimeError("Node returned non-list JSON")
+            except Exception as e:
+                raise RuntimeError(f"Invalid JSON from Node: {e}\nRaw: {out[:200]}...")
+        except Exception as e:
+            last_err = e
+            if attempt < int(STATUS_FETCH_RETRIES):
+                # simple linear backoff
+                try:
+                    time.sleep(max(0.5, float(STATUS_FETCH_RETRY_DELAY_SEC) * (attempt + 1)))
+                except Exception:
+                    pass
+                continue
+            else:
+                break
+    raise RuntimeError(f"Node fetch failed after retries: {last_err}")
 
 
 def _normalize_services(raw: List[Dict[str, float]]) -> Dict[str, float]:
@@ -188,11 +243,14 @@ def _severity_tag(pct: float, down: Optional[List[float]] = None, up: Optional[L
     return ""
 
 
-def _print_snapshot(services: Dict[str, float], watch: Optional[List[str]] = None, down: Optional[List[float]] = None, up: Optional[List[float]] = None, only_watch: bool = False) -> None:
+def _print_snapshot(services: Dict[str, float], watch: Optional[List[str]] = None, down: Optional[List[float]] = None, up: Optional[List[float]] = None, only_watch: bool = False, stale: Optional[Dict[str, bool]] = None, missing: Optional[Dict[str, bool]] = None) -> None:
     # Pretty header with current local time, to visually separate each poll
     ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
     header = f"--- 时间 {ts} ――― DuckCoding 状态 ―――"
     print("\n" + header)
+
+    stale = stale or {}
+    missing = missing or {}
 
     # Order: watched (in user-specified order) first, then the rest by name
     watch = watch or []
@@ -210,6 +268,17 @@ def _print_snapshot(services: Dict[str, float], watch: Optional[List[str]] = Non
     name_width = max((len(n) for n in ordered), default=0)
     name_width = max(18, min(name_width, 36))  # clamp width
 
+    def _tag_str_for(name: str, pct: float) -> str:
+        tag = _severity_tag(pct, down, up)
+        extras: List[str] = []
+        if stale.get(name):
+            extras.append("缓存")
+        elif missing.get(name):
+            extras.append("缺失")
+        parts = [t for t in [tag] if t]
+        parts.extend(extras)
+        return f"  [{','.join(parts)}]" if parts else ""
+
     # Sections
     if watch:
         print("[关注服务]")
@@ -217,23 +286,19 @@ def _print_snapshot(services: Dict[str, float], watch: Optional[List[str]] = Non
             if n not in watch:
                 continue
             pct = services.get(n, 0.0)
-            tag = _severity_tag(pct, down, up)
-            tag_str = f"  [{tag}]" if tag else ""
-            print(f"  • {n:<{name_width}} | 24h {pct:6.2f}%{tag_str}")
+            print(f"  • {n:<{name_width}} | 24h {pct:6.2f}%{_tag_str_for(n, pct)}")
         if not only_watch:
             print("[其他服务]")
             for n in ordered:
                 if n in watch:
                     continue
                 pct = services.get(n, 0.0)
-                print(f"  • {n:<{name_width}} | 24h {pct:6.2f}%")
+                print(f"  • {n:<{name_width}} | 24h {pct:6.2f}%{_tag_str_for(n, pct)}")
     else:
         print("[全部服务]")
         for n in ordered:
             pct = services.get(n, 0.0)
-            tag = _severity_tag(pct, down, up)
-            tag_str = f"  [{tag}]" if tag else ""
-            print(f"  • {n:<{name_width}} | 24h {pct:6.2f}%{tag_str}")
+            print(f"  • {n:<{name_width}} | 24h {pct:6.2f}%{_tag_str_for(n, pct)}")
 
     print("-" * max(40, len(header)))
 
@@ -301,9 +366,52 @@ def _check_crossings_and_update(prev_raw: dict, cur: Dict[str, float], watch: Li
 def run_once(watch: List[str], down: List[float], up: List[float], only_watch: bool = False) -> None:
     raw = _run_node_fetch()
     services = _normalize_services(raw)
-    _print_snapshot(services, watch, down, up, only_watch=only_watch)
+
+    # Remember good values from this round
+    for n, p in services.items():
+        _remember_good_pct(n, p)
+
+    # Build fallback view for printing and for decisions
+    stale_map: Dict[str, bool] = {}
+    missing_map: Dict[str, bool] = {}
+    services_view: Dict[str, float] = dict(services)
+
+    # Ensure watched services always appear
+    for n in (watch or []):
+        if n not in services_view:
+            last = _get_last_good_pct(n)
+            if last is not None:
+                services_view[n] = float(last)
+                stale_map[n] = True
+            else:
+                services_view[n] = 0.0
+                missing_map[n] = True
+
+    # Keep previously seen (non-watched) services visible using last-good cache to avoid empty lists
+    try:
+        for n in list((_LAST_GOOD_SERVICES or {}).keys()):  # type: ignore[name-defined]
+            if n not in services_view:
+                last = _get_last_good_pct(n)
+                if last is not None:
+                    services_view[n] = float(last)
+                    stale_map[n] = True
+    except Exception:
+        pass
+
+    _print_snapshot(services_view, watch, down, up, only_watch=only_watch, stale=stale_map, missing=missing_map)
+
+    # Decision gating: only use current or stale-fallback; skip missing (no data at all)
+    cur_for_decision: Dict[str, float] = {}
+    for n, p in services.items():
+        cur_for_decision[n] = p
+    for n in (watch or []):
+        if n not in cur_for_decision:
+            last = _get_last_good_pct(n)
+            if last is not None:
+                cur_for_decision[n] = float(last)
+
     prev_raw = _load_state_raw()
-    new_state = _check_crossings_and_update(prev_raw, services, watch, down, up)
+    new_state = _check_crossings_and_update(prev_raw, cur_for_decision, watch, down, up)
     _save_state(new_state)
 
 
@@ -337,8 +445,51 @@ def main() -> None:
         try:
             raw = _run_node_fetch()
             services = _normalize_services(raw)
-            _print_snapshot(services, watch_list, args.down, args.up, only_watch=bool(args.only_watch))
-            new_state = _check_crossings_and_update(prev_raw, services, watch_list, args.down, args.up)
+
+            # Remember good values seen this round
+            for n, p in services.items():
+                _remember_good_pct(n, p)
+
+            # Build view for printing and for decision
+            stale_map: Dict[str, bool] = {}
+            missing_map: Dict[str, bool] = {}
+            services_view: Dict[str, float] = dict(services)
+
+            # Ensure watched services always appear
+            for n in watch_list:
+                if n not in services_view:
+                    last = _get_last_good_pct(n)
+                    if last is not None:
+                        services_view[n] = float(last)
+                        stale_map[n] = True
+                    else:
+                        services_view[n] = 0.0
+                        missing_map[n] = True
+
+            # Keep previously seen non-watched services visible using last-good cache
+            try:
+                for n in list((_LAST_GOOD_SERVICES or {}).keys()):  # type: ignore[name-defined]
+                    if n not in services_view:
+                        last = _get_last_good_pct(n)
+                        if last is not None:
+                            services_view[n] = float(last)
+                            stale_map[n] = True
+            except Exception:
+                pass
+
+            _print_snapshot(services_view, watch_list, args.down, args.up, only_watch=bool(args.only_watch), stale=stale_map, missing=missing_map)
+
+            # Only decide with current+stale (skip truly missing)
+            cur_for_decision: Dict[str, float] = {}
+            for n, p in services.items():
+                cur_for_decision[n] = p
+            for n in watch_list:
+                if n not in cur_for_decision:
+                    last = _get_last_good_pct(n)
+                    if last is not None:
+                        cur_for_decision[n] = float(last)
+
+            new_state = _check_crossings_and_update(prev_raw, cur_for_decision, watch_list, args.down, args.up)
             _save_state(new_state)
             prev_raw = new_state
         except subprocess.CalledProcessError as e:

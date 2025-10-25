@@ -78,7 +78,14 @@ FORCE_TOAST = False
 # Cache for benefit tokens to avoid launching a browser every loop
 _BENEFIT_TOKEN_CACHE: Dict[str, str] = {}
 _BENEFIT_TOKEN_CACHE_TS: float = 0.0
-_BENEFIT_TOKEN_CACHE_TTL_SEC: float = 600.0  # 10 minutes
+_BENEFIT_TOKEN_CACHE_TTL_SEC: float = 600.0  # 10 minutes (when cache is complete)
+_BENEFIT_TOKEN_CACHE_TTL_SEC_INCOMPLETE: float = 60.0  # shorter TTL when partial/missing
+_BENEFIT_TOKEN_CACHE_IS_COMPLETE: bool = False
+_BENEFIT_REFRESH_MAX_TRIES: int = 2
+
+# Last known-good details per label (to mask transient UI/API failures)
+_LAST_GOOD_DETAILS: Dict[str, Tuple[QuotaDetails, float]] = {}
+_LAST_GOOD_TTL_SEC: float = 10 * 60  # 10 minutes
 
 # Interactive ack file and Phase-B thresholds
 ACK_FILE = Path(__file__).with_name('duckcoding_ack.txt')
@@ -124,6 +131,52 @@ def _parse_money(value: Any) -> float:
     if not m:
         return 0.0
     return float(m.group(0).replace(",", ""))
+
+
+def _is_plausible_details(q: QuotaDetails) -> bool:
+    """Heuristic validity check to filter out transient scrape/API zeros.
+    Consider plausible if any of total/used/remaining is positive.
+    Reject clearly inconsistent values (used/remaining >> total by large margin).
+    """
+    try:
+        t, u, r = float(q.total_yen or 0.0), float(q.used_yen or 0.0), float(q.remaining_yen or 0.0)
+        if t <= 0 and u <= 0 and r <= 0:
+            return False
+        # If total is known (>0), bound used/remaining relative to it
+        if t > 0:
+            if u < 0 or r < 0:
+                return False
+            # Allow small rounding drift
+            if u > t * 1.2 + 1.0:
+                return False
+            if r > t * 1.2 + 1.0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _remember_good(label: str, q: QuotaDetails) -> None:
+    try:
+        if _is_plausible_details(q):
+            _LAST_GOOD_DETAILS[label] = (q, time.time())
+    except Exception:
+        pass
+
+
+def _get_last_good_if_fresh(label: str, max_age_sec: Optional[float] = None) -> Optional[QuotaDetails]:
+    try:
+        if label not in _LAST_GOOD_DETAILS:
+            return None
+        q, ts = _LAST_GOOD_DETAILS.get(label, (None, 0.0))  # type: ignore
+        if not isinstance(q, QuotaDetails):
+            return None
+        ttl = _LAST_GOOD_TTL_SEC if max_age_sec is None else float(max_age_sec)
+        if (time.time() - float(ts)) <= ttl:
+            return q
+        return None
+    except Exception:
+        return None
 
 
 def _notify(title: str, msg: str) -> None:
@@ -411,16 +464,30 @@ def fetch_remaining_yen_best(token: str) -> float:
 
 
 def fetch_details_best(token: str) -> QuotaDetails:
-    """Prefer Playwright UI scrape for authoritative values; fall back to API."""
+    """Prefer Playwright UI scrape for authoritative values; fall back to API.
+    If only remaining can be obtained, return a partial QuotaDetails with remaining_yen set.
+    """
     via_ui = _fetch_details_via_site(token)
-    if isinstance(via_ui, QuotaDetails):
+    if isinstance(via_ui, QuotaDetails) and _is_plausible_details(via_ui):
         return via_ui
+
+    # Try API next
     try:
-        return fetch_details_api(token)
+        via_api = fetch_details_api(token)
+        if _is_plausible_details(via_api):
+            return via_api
     except Exception:
-        # Last resort: build from remaining-only
-        r = fetch_remaining_yen_best(token)
-        return QuotaDetails(remaining_yen=r)
+        via_api = None  # ignored
+
+    # Last-resort: remaining only via site (faster) or API
+    r = _fetch_remaining_yen_via_site(token)
+    if isinstance(r, (int, float)):
+        return QuotaDetails(remaining_yen=float(r))
+    try:
+        r2 = fetch_remaining_yen(token)
+        return QuotaDetails(remaining_yen=float(r2))
+    except Exception:
+        return QuotaDetails()
 
 
 def _auto_fetch_token_via_playwright() -> Optional[str]:
@@ -460,7 +527,7 @@ def _auto_fetch_all_benefit_tokens() -> Dict[str, str]:
         out = subprocess.check_output(
             ["node", str(script_path)],
             stderr=subprocess.STDOUT,
-            timeout=60,
+            timeout=75,
             text=True,
             cwd=str(Path(__file__).parent),
         ).strip()
@@ -496,11 +563,21 @@ def resolve_token() -> str:
     # Try benefits page first (prefer CodeX 专用福利)
     global _BENEFIT_TOKEN_CACHE, _BENEFIT_TOKEN_CACHE_TS
     now = time.time()
-    if not _BENEFIT_TOKEN_CACHE or (now - _BENEFIT_TOKEN_CACHE_TS) > _BENEFIT_TOKEN_CACHE_TTL_SEC:
+    if not _BENEFIT_TOKEN_CACHE or (now - _BENEFIT_TOKEN_CACHE_TS) > (_BENEFIT_TOKEN_CACHE_TTL_SEC if _BENEFIT_TOKEN_CACHE_IS_COMPLETE else _BENEFIT_TOKEN_CACHE_TTL_SEC_INCOMPLETE):
         _BENEFIT_TOKEN_CACHE = _auto_fetch_all_benefit_tokens()
         _BENEFIT_TOKEN_CACHE_TS = now
     # Normalize keys possibly returned by JS
     normalized = { _canonical_label(k): v for k, v in _BENEFIT_TOKEN_CACHE.items() }
+    # If missing CodeX, try a couple of extra refreshes immediately
+    if not (normalized.get("CodeX 专用福利") or "CodeX 专用福利" in normalized):
+        for _ in range(_BENEFIT_REFRESH_MAX_TRIES):
+            time.sleep(1.0)
+            fresh = _auto_fetch_all_benefit_tokens()
+            if fresh:
+                _BENEFIT_TOKEN_CACHE.update(fresh)
+                normalized = { _canonical_label(k): v for k, v in _BENEFIT_TOKEN_CACHE.items() }
+            if normalized.get("CodeX 专用福利"):
+                break
     codex = normalized.get("CodeX 专用福利")
     if codex and codex.startswith("sk-"):
         print("[DuckCoding] Using CodeX 专用福利 token from benefits page")
@@ -517,18 +594,45 @@ def resolve_token() -> str:
 
 
 def get_benefit_tokens() -> Dict[str, str]:
-    """Get cached map of benefit tokens; refresh if cache expired. Keys normalized to canonical labels."""
-    global _BENEFIT_TOKEN_CACHE, _BENEFIT_TOKEN_CACHE_TS
+    """Get cached map of benefit tokens; refresh if cache expired. Keys normalized to canonical labels.
+    If the set is incomplete, perform a few immediate refresh attempts and shorten the TTL for partial cache.
+    """
+    global _BENEFIT_TOKEN_CACHE, _BENEFIT_TOKEN_CACHE_TS, _BENEFIT_TOKEN_CACHE_IS_COMPLETE
     now = time.time()
-    if not _BENEFIT_TOKEN_CACHE or (now - _BENEFIT_TOKEN_CACHE_TS) > _BENEFIT_TOKEN_CACHE_TTL_SEC:
+
+    # Decide TTL based on completeness of previous cache
+    ttl = _BENEFIT_TOKEN_CACHE_TTL_SEC if _BENEFIT_TOKEN_CACHE_IS_COMPLETE else _BENEFIT_TOKEN_CACHE_TTL_SEC_INCOMPLETE
+
+    if not _BENEFIT_TOKEN_CACHE or (now - _BENEFIT_TOKEN_CACHE_TS) > ttl:
         _BENEFIT_TOKEN_CACHE = _auto_fetch_all_benefit_tokens()
         _BENEFIT_TOKEN_CACHE_TS = now
-    out: Dict[str, str] = {}
-    for k, v in (_BENEFIT_TOKEN_CACHE or {}).items():
-        canonical = _canonical_label(k)
-        if canonical and isinstance(v, str) and v.startswith('sk-'):
-            out[canonical] = v
-    return out
+
+    def _normalize(raw: Dict[str, str]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for k, v in (raw or {}).items():
+            canonical = _canonical_label(k)
+            if canonical and isinstance(v, str) and v.startswith('sk-'):
+                out[canonical] = v
+        return out
+
+    normalized = _normalize(_BENEFIT_TOKEN_CACHE)
+
+    # If incomplete, try a couple of immediate refresh attempts
+    needed = {"Claude Code 专用福利", "CodeX 专用福利", "Gemini CLI 专用福利"}
+    if not needed.issubset(set(normalized.keys())):
+        for _ in range(_BENEFIT_REFRESH_MAX_TRIES):
+            time.sleep(1.0)
+            fresh = _auto_fetch_all_benefit_tokens()
+            if fresh:
+                # Merge (prefer fresh)
+                _BENEFIT_TOKEN_CACHE.update(fresh)
+                normalized = _normalize(_BENEFIT_TOKEN_CACHE)
+            if needed.issubset(set(normalized.keys())):
+                break
+
+    # Mark completeness and return
+    _BENEFIT_TOKEN_CACHE_IS_COMPLETE = needed.issubset(set(normalized.keys()))
+    return normalized
 
 # Safer print that respects current console encoding and avoids mojibake
 _def_print_encoding = None
@@ -556,17 +660,25 @@ def _print_cycle_header() -> None:
     _safe_print(f"--- 时间 {ts} ――― DuckCoding 额度 ―――")
 
 
-def _quota_tag(label: str, q: QuotaDetails) -> str:
-    # Tag only for CodeX 专用福利，显示基准阈值简单状态
-    if label == "CodeX 专用福利":
-        try:
-            return f"[>¥{THRESHOLD_YEN:.0f}]" if (q.remaining_yen or 0.0) > THRESHOLD_YEN else f"[≤¥{THRESHOLD_YEN:.0f}]"
-        except Exception:
-            return ""
-    return ""
+def _quota_tag(label: str, q: QuotaDetails, stale: bool = False, missing: bool = False) -> str:
+    # Tag only for CodeX 专用福利，显示基准阈值简单状态 + 附加状态（缓存/缺失）
+    if label != "CodeX 专用福利":
+        return ""
+    parts: List[str] = []
+    try:
+        parts.append((f">¥{THRESHOLD_YEN:.0f}") if ((q.remaining_yen or 0.0) > THRESHOLD_YEN) else (f"≤¥{THRESHOLD_YEN:.0f}"))
+    except Exception:
+        pass
+    if stale:
+        parts.append("缓存")
+    elif missing:
+        parts.append("缺失")
+    if not parts:
+        return ""
+    return "[" + ",".join(parts) + "]"
 
 
-def _print_quota_snapshot(details_map: Dict[str, QuotaDetails], order: List[str]) -> None:
+def _print_quota_snapshot(details_map: Dict[str, QuotaDetails], order: List[str], stale: Optional[Dict[str, bool]] = None, missing: Optional[Dict[str, bool]] = None) -> None:
     # Pretty header with current local time, to visually separate each poll
     try:
         ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
@@ -579,10 +691,13 @@ def _print_quota_snapshot(details_map: Dict[str, QuotaDetails], order: List[str]
     name_width = max((len(lbl) for lbl in order), default=0)
     name_width = max(10, min(name_width, 24))
 
+    stale = stale or {}
+    missing = missing or {}
+
     for label in order:
         q = details_map.get(label, QuotaDetails())
         used_pct_str = f"{q.used_percent:.1f}%" if q.used_percent > 0 else "—"
-        tag = _quota_tag(label, q)
+        tag = _quota_tag(label, q, stale=bool(stale.get(label)), missing=bool(missing.get(label)))
         tag_str = f"  {tag}" if tag else ""
         line = (
             f"  • {label:<{name_width}} | 总 ¥{q.total_yen:8.2f} | 用 ¥{q.used_yen:8.2f} ({used_pct_str:>5}) | 余 ¥{q.remaining_yen:8.2f}{tag_str}"
@@ -624,6 +739,8 @@ def main() -> None:
 
             # Collect details for all three benefits; always print one line per benefit
             details_map: Dict[str, QuotaDetails] = {lbl: QuotaDetails() for lbl in order}
+            stale_map: Dict[str, bool] = {lbl: False for lbl in order}
+            missing_map: Dict[str, bool] = {lbl: False for lbl in order}
 
             def _safe_fetch(token: str, label: str) -> QuotaDetails:
                 try:
@@ -632,18 +749,59 @@ def main() -> None:
                     _safe_print(f"[DuckCoding] {label} 查询失败: {e}")
                     return QuotaDetails()
 
+            # Fetch with plausibility checks + last-good fallback
             for label in order:
                 tok = tokens_map.get(label)
-                if tok:
-                    details_map[label] = _safe_fetch(tok, label)
+                if not tok:
+                    missing_map[label] = True
+                    continue
+                q = _safe_fetch(tok, label)
+                if not _is_plausible_details(q):
+                    # Try fast remaining-only UI path to at least fill remaining
+                    r_try = _fetch_remaining_yen_via_site(tok)
+                    if isinstance(r_try, (int, float)):
+                        try:
+                            q.remaining_yen = float(r_try)
+                        except Exception:
+                            pass
+                if _is_plausible_details(q):
+                    details_map[label] = q
+                    _remember_good(label, q)
+                else:
+                    last = _get_last_good_if_fresh(label)
+                    if isinstance(last, QuotaDetails):
+                        details_map[label] = last
+                        stale_map[label] = True
+                    else:
+                        details_map[label] = q  # keep zeros
+                        missing_map[label] = True
+
+            # If some labels missing entirely, try refreshing benefits once and re-try those labels
+            missing_labels = {lbl for lbl, is_missing in missing_map.items() if is_missing}
+            if missing_labels:
+                fresh_map = get_benefit_tokens()
+                for label in list(missing_labels):
+                    if fresh_map.get(label):
+                        tok = fresh_map.get(label)
+                        q2 = _safe_fetch(tok, label)
+                        if _is_plausible_details(q2):
+                            details_map[label] = q2
+                            stale_map[label] = False
+                            missing_map[label] = False
+                            _remember_good(label, q2)
 
             # Ensure CodeX line uses a resolved token if benefits page didn't provide it
-            if details_map["CodeX 专用福利"].remaining_yen <= 0 and not tokens_map.get("CodeX 专用福利"):
+            if missing_map.get("CodeX 专用福利") and not tokens_map.get("CodeX 专用福利"):
                 token = resolve_token()
-                details_map["CodeX 专用福利"] = _safe_fetch(token, "CodeX 专用福利")
+                qx = _safe_fetch(token, "CodeX 专用福利")
+                if _is_plausible_details(qx):
+                    details_map["CodeX 专用福利"] = qx
+                    stale_map["CodeX 专用福利"] = False
+                    missing_map["CodeX 专用福利"] = False
+                    _remember_good("CodeX 专用福利", qx)
 
             # Pretty snapshot
-            _print_quota_snapshot(details_map, order)
+            _print_quota_snapshot(details_map, order, stale=stale_map, missing=missing_map)
 
             codex_remaining = details_map["CodeX 专用福利"].remaining_yen
 
@@ -652,6 +810,12 @@ def main() -> None:
 
             remaining = float(codex_remaining or 0.0)
             ack = _read_ack_flag()
+
+            # 如果本轮 CodeX 数据缺失（没有可信新数据、也无缓存可用），则跳过判定，避免状态抖动
+            decision_ok = _is_plausible_details(details_map.get("CodeX 专用福利", QuotaDetails())) or bool(stale_map.get("CodeX 专用福利"))
+            if not decision_ok:
+                print("[DuckCoding] 跳过本轮判定：CodeX 数据缺失/未加载（保持上次状态）")
+                continue
 
             if phase == 'A':
                 # 方式一：用户把 ack 文件写成 1，则立即切到阶段B
@@ -739,6 +903,8 @@ if __name__ == "__main__":
             order: List[str] = ["Claude Code 专用福利", "CodeX 专用福利", "Gemini CLI 专用福利"]
 
             details_map: Dict[str, QuotaDetails] = {lbl: QuotaDetails() for lbl in order}
+            stale_map: Dict[str, bool] = {lbl: False for lbl in order}
+            missing_map: Dict[str, bool] = {lbl: False for lbl in order}
 
             def _safe_fetch_once(token: str, label: str) -> QuotaDetails:
                 try:
@@ -749,18 +915,44 @@ if __name__ == "__main__":
 
             for label in order:
                 tok = tokens_map.get(label)
-                if tok:
-                    details_map[label] = _safe_fetch_once(tok, label)
+                if not tok:
+                    missing_map[label] = True
+                    continue
+                q = _safe_fetch_once(tok, label)
+                if not _is_plausible_details(q):
+                    r_try = _fetch_remaining_yen_via_site(tok)
+                    if isinstance(r_try, (int, float)):
+                        try:
+                            q.remaining_yen = float(r_try)
+                        except Exception:
+                            pass
+                if _is_plausible_details(q):
+                    details_map[label] = q
+                    _remember_good(label, q)
+                else:
+                    last = _get_last_good_if_fresh(label)
+                    if isinstance(last, QuotaDetails):
+                        details_map[label] = last
+                        stale_map[label] = True
+                    else:
+                        details_map[label] = q
+                        missing_map[label] = True
 
-            if details_map["CodeX 专用福利"].remaining_yen <= 0 and not tokens_map.get("CodeX 专用福利"):
+            if missing_map.get("CodeX 专用福利") and not tokens_map.get("CodeX 专用福利"):
                 token = resolve_token()
-                details_map["CodeX 专用福利"] = _safe_fetch_once(token, "CodeX 专用福利")
+                qx = _safe_fetch_once(token, "CodeX 专用福利")
+                if _is_plausible_details(qx):
+                    details_map["CodeX 专用福利"] = qx
+                    stale_map["CodeX 专用福利"] = False
+                    missing_map["CodeX 专用福利"] = False
+                    _remember_good("CodeX 专用福利", qx)
 
-            _print_quota_snapshot(details_map, order)
+            _print_quota_snapshot(details_map, order, stale=stale_map, missing=missing_map)
 
             remaining = float(details_map["CodeX 专用福利"].remaining_yen or 0.0)
             ack = _read_ack_flag()
-            if ack == 0 and remaining > THRESHOLD_YEN:
+            decision_ok = _is_plausible_details(details_map.get("CodeX 专用福利", QuotaDetails())) or bool(stale_map.get("CodeX 专用福利"))
+            if decision_ok and ack == 0 and remaining > THRESHOLD_YEN:
                 _notify("DuckCoding 额度提醒", f"CodeX 剩余额度：¥{remaining:.2f}，超过阈值 ¥{THRESHOLD_YEN:.2f}")
         except Exception as e:
             print("[DuckCoding] Error:", e)

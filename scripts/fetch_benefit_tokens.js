@@ -33,9 +33,10 @@ function canonicalLabel(title) {
 
 async function extractTokenFromCard(card) {
   // Click 显示令牌 within the card, then read sk-... from the same card
-  try { await card.getByRole('button', { name: '显示令牌' }).click({ timeout: 6000 }); } catch (_) {}
+  try { await card.scrollIntoViewIfNeeded({ timeout: 3000 }); } catch (_) {}
+  try { await card.getByRole('button', { name: '显示令牌' }).click({ timeout: 12000 }); } catch (_) {}
   const tokenNode = card.locator('text=/sk-[A-Za-z0-9]+/');
-  try { await tokenNode.first().waitFor({ state: 'visible', timeout: 6000 }); } catch (_) {}
+  try { await tokenNode.first().waitFor({ state: 'visible', timeout: 12000 }); } catch (_) {}
   const txt = (await tokenNode.first().innerText().catch(() => '')) || '';
   const m = txt.match(/sk-[A-Za-z0-9]+/);
   return m ? m[0] : '';
@@ -57,7 +58,7 @@ async function main() {
     for (const key of labels) {
       const card = page.locator(`xpath=//div[.//h3[contains(., "${key}") and contains(., "专用福利")]]`).first();
       try {
-        await card.waitFor({ state: 'visible', timeout: 8000 });
+        await card.waitFor({ state: 'visible', timeout: 12000 });
         const title = ((await card.locator('xpath=.//h3').first().innerText().catch(() => '')) || '').trim();
         const canon = canonicalLabel(title) || canonicalLabel(key);
         const token = await extractTokenFromCard(card);
@@ -70,7 +71,7 @@ async function main() {
       const buttons = page.getByRole('button', { name: '显示令牌' });
       const count = await buttons.count();
       for (let i = 0; i < count; i++) {
-        try { await buttons.nth(i).click({ timeout: 8000 }); } catch (_) {}
+        try { const btn = buttons.nth(i); await btn.scrollIntoViewIfNeeded({ timeout: 3000 }); await btn.click({ timeout: 12000 }); } catch (_) {}
       }
       const tokenNodes = page.locator('text=/sk-[A-Za-z0-9]+/');
       const tcount = await tokenNodes.count();
@@ -78,7 +79,7 @@ async function main() {
         const el = tokenNodes.nth(j);
         const titleNode = el.locator('xpath=(preceding::h3)[last()]');
         let title = '';
-        try { title = (await titleNode.innerText({ timeout: 2000 }))?.trim() || ''; } catch (_) {}
+        try { title = (await titleNode.innerText({ timeout: 4000 }))?.trim() || ''; } catch (_) {}
         const txt = (await el.innerText().catch(() => '')) || '';
         const m = txt.match(/sk-[A-Za-z0-9]+/);
         const canon = canonicalLabel(title);
