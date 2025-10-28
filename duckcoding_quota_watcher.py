@@ -27,6 +27,10 @@ import subprocess
 from pathlib import Path
 import sys
 import warnings
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.utils import formataddr
 try:
     import winsound  # type: ignore
 except Exception:
@@ -71,9 +75,37 @@ BEEP_FREQUENCY_HZ = 1200
 BEEP_DURATION_MS = 250
 # ============================
 
+# HTML history time window (keep approx 12h in dashboard regardless of interval)
+HISTORY_WINDOW_SEC = 12 * 3600
+
+# Local persistent history storage (untracked)
+DATA_DIR_DEFAULT = Path(__file__).with_name('data')
+HISTORY_FILE_NAME = 'quota_history.csv'
+
+# Email defaults (can be overridden by env or CLI)
+EMAIL_DEFAULT_TO = os.environ.get('ALERT_EMAIL_TO', 'zhiangxu1093@gmail.com')
+EMAIL_DEFAULT_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+EMAIL_DEFAULT_PORT = int(os.environ.get('SMTP_PORT', '587') or 587)
+EMAIL_DEFAULT_STARTTLS = str(os.environ.get('SMTP_STARTTLS', '1')).strip() not in ('0', 'false', 'no')
+EMAIL_DEFAULT_SSL = str(os.environ.get('SMTP_SSL', '0')).strip() not in ('0', 'false', 'no')
+EMAIL_DEFAULT_TIMEOUT = float(os.environ.get('SMTP_TIMEOUT', '18') or 18)
+EMAIL_DEFAULT_USER = os.environ.get('SMTP_USER', '')
+EMAIL_DEFAULT_PASS = os.environ.get('SMTP_PASS', os.environ.get('SMTP_PASSWORD', ''))
+EMAIL_DEFAULT_FROM = os.environ.get('SMTP_FROM', EMAIL_DEFAULT_USER or EMAIL_DEFAULT_TO)
+
+# Dedup same-subject emails within TTL to avoid spamming
+_EMAIL_DEDUP_TTL_SEC = 3600  # 1 hour
+_LAST_EMAIL_SENT: Dict[str, float] = {}
+
 # Runtime toggles (set by CLI)
 FORCE_MESSAGEBOX = False
 FORCE_TOAST = False
+
+# Runtime email/data controls (populated from CLI/env in __main__)
+EMAIL_ENABLED = False
+EMAIL_DRY_RUN = False
+EMAIL_CFG: Optional[EmailConfig] = None
+DATA_DIR_PATH: Path = DATA_DIR_DEFAULT
 
 # Cache for benefit tokens to avoid launching a browser every loop
 _BENEFIT_TOKEN_CACHE: Dict[str, str] = {}
@@ -89,7 +121,7 @@ _LAST_GOOD_TTL_SEC: float = 10 * 60  # 10 minutes
 
 # Interactive ack file and Phase-B thresholds
 ACK_FILE = Path(__file__).with_name('duckcoding_ack.txt')
-PHASE_B_THRESHOLDS: List[float] = [50.0, 20.0, 10.0, 5.0]
+PHASE_B_THRESHOLDS: List[float] = [50.0, 20.0, 10.0, 5.0, 3.0]
 
 # Toast notifier (optional). Disabled by default to avoid rare WNDPROC/WPARAM console noise on some hosts.
 _toaster = None
@@ -112,7 +144,7 @@ USE_TOAST_BY_DEFAULT = True
 # When set via --html, the watcher will continuously write/update an HTML file
 # containing a Plotly-based line chart showing three benefit balances over time.
 HTML_OUTPUT_PATH: Optional[Path] = None
-_MAX_HISTORY_POINTS: int = 14400  # keep roughly 12 hours at 60s interval
+_MAX_HISTORY_POINTS: int = 720  # keep roughly 12 hours at 60s interval
 _HISTORY_T: List[float] = []  # epoch seconds per sample
 _HISTORY_SERIES: Dict[str, List[float]] = {}  # label -> series of remaining_yen
 
@@ -186,6 +218,227 @@ def _get_last_good_if_fresh(label: str, max_age_sec: Optional[float] = None) -> 
         return None
     except Exception:
         return None
+
+# -------- Email helpers (SMTP) --------
+
+def _load_env_file(path: Path) -> Dict[str, str]:
+    """Load simple KEY=VALUE lines from a .env-style file. Returns dict; ignores comments/blank lines."""
+    kv: Dict[str, str] = {}
+    try:
+        if not path.exists():
+            return kv
+        for line in path.read_text(encoding='utf-8', errors='ignore').splitlines():
+            s = line.strip()
+            if not s or s.startswith('#'):
+                continue
+            if '=' not in s:
+                continue
+            k, v = s.split('=', 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k:
+                kv[k] = v
+    except Exception:
+        return kv
+    return kv
+
+
+def _apply_env_from_files(paths: List[Path]) -> Dict[str, str]:
+    """Load env vars from a list of files; last one wins. Updates os.environ and returns merged dict."""
+    merged: Dict[str, str] = {}
+    for p in paths:
+        cur = _load_env_file(p)
+        if not cur:
+            continue
+        merged.update(cur)
+    for k, v in merged.items():
+        os.environ.setdefault(k, v)
+    return merged
+
+
+@dataclass
+class EmailConfig:
+    host: str
+    port: int
+    starttls: bool
+    use_ssl: bool
+    timeout: float
+    user: str
+    password: str
+    from_addr: str
+    to_addrs: List[str]
+
+
+def _resolve_email_config(args: Any) -> Optional[EmailConfig]:
+    """Resolve email config from CLI args, env, and reasonable defaults.
+    Returns None if required pieces are missing (user or recipients).
+    """
+    # Load local env files once (no-op if already loaded)
+    root = Path(__file__).parent
+    _apply_env_from_files([root / '.env', root / '.env.local'])
+
+    to_str = getattr(args, 'email_to', None) or os.environ.get('ALERT_EMAIL_TO', EMAIL_DEFAULT_TO)
+    to_list = [s.strip() for s in (to_str or '').split(',') if s.strip()]
+
+    host = getattr(args, 'smtp_host', None) or os.environ.get('SMTP_HOST', EMAIL_DEFAULT_HOST)
+    try:
+        port = int(getattr(args, 'smtp_port', None) or os.environ.get('SMTP_PORT', str(EMAIL_DEFAULT_PORT)))
+    except Exception:
+        port = EMAIL_DEFAULT_PORT
+
+    starttls_env = (getattr(args, 'smtp_starttls', None) if hasattr(args, 'smtp_starttls') else None)
+    if starttls_env is None:
+        starttls_env = os.environ.get('SMTP_STARTTLS')
+    starttls = EMAIL_DEFAULT_STARTTLS if starttls_env is None else (str(starttls_env).strip() not in ('0','false','no'))
+
+    ssl_env = (getattr(args, 'smtp_ssl', None) if hasattr(args, 'smtp_ssl') else None)
+    if ssl_env is None:
+        ssl_env = os.environ.get('SMTP_SSL')
+    use_ssl_flag = EMAIL_DEFAULT_SSL if ssl_env is None else (str(ssl_env).strip() not in ('0','false','no'))
+
+    # Heuristic: if port == 465, default to SSL regardless of starttls flag
+    use_ssl = bool(use_ssl_flag or (int(port) == 465))
+    # If SSL chosen, ignore starttls
+    if use_ssl:
+        starttls = False
+
+    try:
+        timeout_val = float(getattr(args, 'smtp_timeout', None) or os.environ.get('SMTP_TIMEOUT', str(EMAIL_DEFAULT_TIMEOUT)))
+    except Exception:
+        timeout_val = EMAIL_DEFAULT_TIMEOUT
+
+    user = getattr(args, 'smtp_user', None) or os.environ.get('SMTP_USER', EMAIL_DEFAULT_USER)
+    password = getattr(args, 'smtp_pass', None) or os.environ.get('SMTP_PASS') or os.environ.get('SMTP_PASSWORD', EMAIL_DEFAULT_PASS)
+    from_addr = getattr(args, 'smtp_from', None) or os.environ.get('SMTP_FROM') or (user or EMAIL_DEFAULT_FROM)
+
+    if not to_list:
+        return None
+    if not user:
+        # Allow anonymous send only if host allows, but we default to require user for Gmail
+        return None
+
+    return EmailConfig(
+        host=str(host or 'smtp.gmail.com'),
+        port=int(port or 587),
+        starttls=bool(starttls),
+        use_ssl=bool(use_ssl),
+        timeout=float(timeout_val or EMAIL_DEFAULT_TIMEOUT),
+        user=str(user),
+        password=str(password or ''),
+        from_addr=str(from_addr or user),
+        to_addrs=to_list,
+    )
+
+
+def _send_email(cfg: EmailConfig, subject: str, body: str, dry_run: bool = False) -> bool:
+    """Send a plain-text email. Returns True on success. Best-effort; catches exceptions.
+    Auto-fallback for Gmail: if configured path times out and host is smtp.gmail.com,
+    try alternate port/mode (465 SSL <-> 587 STARTTLS).
+    """
+    try:
+        if dry_run:
+            print(f"[DuckCoding][EMAIL-DRY] to={cfg.to_addrs} subj={subject} body={body[:120]}...")
+            return True
+        msg = MIMEText(body, _subtype='plain', _charset='utf-8')
+        msg['Subject'] = subject
+        msg['From'] = formataddr(('DuckCoding Alert', cfg.from_addr))
+        msg['To'] = ', '.join(cfg.to_addrs)
+
+        def _send_once(c: EmailConfig) -> bool:
+            mode = 'SSL' if c.use_ssl else ('STARTTLS' if c.starttls else 'PLAIN')
+            print(f"[DuckCoding][EMAIL] {c.host}:{c.port} mode={mode}")
+            ctx = ssl.create_default_context()
+            s = None
+            try:
+                if c.use_ssl:
+                    s = smtplib.SMTP_SSL(c.host, int(c.port), timeout=float(c.timeout), context=ctx)
+                    try:
+                        s.ehlo()
+                    except Exception:
+                        pass
+                else:
+                    s = smtplib.SMTP(c.host, int(c.port), timeout=float(c.timeout))
+                    try:
+                        s.ehlo()
+                    except Exception:
+                        pass
+                    if c.starttls:
+                        try:
+                            s.starttls(context=ctx)
+                            try:
+                                s.ehlo()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                if c.user:
+                    s.login(c.user, c.password)
+                res = s.sendmail(c.from_addr, c.to_addrs, msg.as_string())
+                # res is a dict of refused recipients; empty dict means success
+                return not bool(res)
+            except Exception:
+                return False
+            finally:
+                if s is not None:
+                    try:
+                        s.quit()
+                    except Exception:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+
+        try:
+            _send_once(cfg)
+            return True
+        except Exception as e1:
+            # Auto-fallback for common dual-mode providers (Gmail/QQ): 465<->587, SSL<->STARTTLS
+            host_lc = (cfg.host or '').lower().strip()
+            is_dual = any(k in host_lc for k in ('gmail.com', 'googlemail.com', 'qq.com'))
+            if not is_dual:
+                raise
+            # Build alternate config
+            alt_port = (587 if cfg.use_ssl else 465)
+            alt = EmailConfig(
+                host=cfg.host,
+                port=alt_port,
+                starttls=(alt_port == 587),
+                use_ssl=(alt_port == 465),
+                timeout=cfg.timeout,
+                user=cfg.user,
+                password=cfg.password,
+                from_addr=cfg.from_addr,
+                to_addrs=cfg.to_addrs,
+            )
+            try:
+                print('[DuckCoding] SMTP 重试：切换为', ('SSL:465' if alt.use_ssl else 'STARTTLS:587'))
+                ok_alt = _send_once(alt)
+                if ok_alt:
+                    return True
+                else:
+                    raise RuntimeError('Alt path failed to send')
+            except Exception as e2:
+                # Re-raise the latest error
+                raise e2
+    except Exception as e:
+        print('[DuckCoding] 邮件发送失败:', e)
+        return False
+
+
+def _email_notify(subject: str, body: str, cfg: Optional[EmailConfig], dry_run: bool = False) -> None:
+    """Best-effort email notify with simple dedup by subject within TTL to avoid spamming."""
+    if cfg is None:
+        return
+    try:
+        now = time.time()
+        last = _LAST_EMAIL_SENT.get(subject, 0.0)
+        if (now - float(last)) < _EMAIL_DEDUP_TTL_SEC:
+            return
+        ok = _send_email(cfg, subject, body, dry_run=dry_run)
+        if ok:
+            _LAST_EMAIL_SENT[subject] = now
+    except Exception:
+        pass
 
 
 def _notify(title: str, msg: str) -> None:
@@ -725,9 +978,10 @@ def _ensure_history_keys(order: List[str]) -> None:
 
 
 def _append_history(order: List[str], details_map: Dict[str, QuotaDetails]) -> None:
-    """Append current snapshot into in-memory history and keep arrays aligned/trimmed."""
+    """Append current snapshot into in-memory history and keep arrays aligned/trimmed (12h window)."""
     _ensure_history_keys(order)
-    _HISTORY_T.append(time.time())
+    now = time.time()
+    _HISTORY_T.append(now)
     for label in order:
         q = details_map.get(label, QuotaDetails())
         try:
@@ -736,16 +990,36 @@ def _append_history(order: List[str], details_map: Dict[str, QuotaDetails]) -> N
             val = 0.0
         _HISTORY_SERIES[label].append(val)
 
-    # Trim to max points (drop oldest across all arrays to keep aligned)
+    # Trim by time window (12h)
+    cutoff = now - float(HISTORY_WINDOW_SEC)
+    trim_idx = 0
+    for i, t in enumerate(_HISTORY_T):
+        try:
+            if float(t) >= cutoff:
+                trim_idx = i
+                break
+        except Exception:
+            continue
+    else:
+        trim_idx = len(_HISTORY_T)
+
+    if trim_idx > 0:
+        del _HISTORY_T[:trim_idx]
+        for label in list(_HISTORY_SERIES.keys()):
+            if len(_HISTORY_SERIES[label]) >= trim_idx:
+                del _HISTORY_SERIES[label][:trim_idx]
+            else:
+                _HISTORY_SERIES[label].clear()
+
+    # Additional cap to keep memory bounded
     if len(_HISTORY_T) > _MAX_HISTORY_POINTS:
         drop = len(_HISTORY_T) - _MAX_HISTORY_POINTS
-        if drop > 0:
-            del _HISTORY_T[:drop]
-            for label in list(_HISTORY_SERIES.keys()):
-                if len(_HISTORY_SERIES[label]) > drop:
-                    del _HISTORY_SERIES[label][:drop]
-                else:
-                    _HISTORY_SERIES[label].clear()
+        del _HISTORY_T[:drop]
+        for label in list(_HISTORY_SERIES.keys()):
+            if len(_HISTORY_SERIES[label]) >= drop:
+                del _HISTORY_SERIES[label][:drop]
+            else:
+                _HISTORY_SERIES[label].clear()
 
 
 def _render_plot_html(order: List[str]) -> str:
@@ -877,6 +1151,55 @@ def _update_html_dashboard(order: List[str]) -> None:
         print("[DuckCoding] HTML 写入失败:", e)
 
 
+def _persist_snapshot_csv(data_dir: Path, order: List[str], details_map: Dict[str, QuotaDetails], ts: Optional[float] = None) -> Path:
+    """Append a CSV row with full snapshot for all benefits into data_dir/quota_history.csv.
+    Keeps all history (no trimming). File is created with header if missing.
+    """
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    path = data_dir / HISTORY_FILE_NAME
+    if ts is None:
+        ts = time.time()
+    try:
+        ts_iso = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(ts)))
+    except Exception:
+        ts_iso = str(ts)
+
+    # Build row in fixed order: timestamp columns then for each label: total, used, percent, remaining
+    cols: List[str] = [ts_iso, f"{float(ts):.3f}"]
+    for label in order:
+        q = details_map.get(label, QuotaDetails())
+        cols.extend([
+            f"{float(q.total_yen or 0.0):.2f}",
+            f"{float(q.used_yen or 0.0):.2f}",
+            f"{float(q.used_percent or 0.0):.2f}",
+            f"{float(q.remaining_yen or 0.0):.2f}",
+        ])
+
+    line = ",".join(cols) + "\n"
+
+    if not path.exists():
+        # Write header
+        header = ["ts_iso", "ts_epoch"]
+        for label in order:
+            base = label
+            header.extend([f"{base}_total", f"{base}_used", f"{base}_used_percent", f"{base}_remaining"])
+        try:
+            path.write_text(",".join(header) + "\n" + line, encoding='utf-8')
+        except Exception:
+            pass
+        return path
+
+    try:
+        with path.open('a', encoding='utf-8', newline='') as f:
+            f.write(line)
+    except Exception:
+        pass
+    return path
+
+
 def _print_details(label: str, q: QuotaDetails) -> None:
     # Backward-compat single-line printer (unused in snapshot)
     used_pct_str = f"{q.used_percent:.1f}%" if q.used_percent > 0 else "—"
@@ -893,6 +1216,7 @@ def main() -> None:
     prev_remaining: Optional[float] = None
     fired_thresholds: set[float] = set()
     phase_b_first_alert_done: bool = False  # 阶段B中，仅首次跨里程碑时弹窗+提示音
+    phase_a_email_sent: bool = False        # 阶段A中，仅发送一次邮件（直到进入B并回到A后才可再次发送）
 
     # Ensure ack file exists with 0
     try:
@@ -973,6 +1297,12 @@ def main() -> None:
             # Pretty snapshot
             _print_quota_snapshot(details_map, order, stale=stale_map, missing=missing_map)
 
+            # Persist full snapshot to CSV (unbounded history)
+            try:
+                _persist_snapshot_csv(DATA_DIR_PATH, order, details_map)
+            except Exception as e:
+                print("[DuckCoding] 历史持久化失败:", e)
+
             # Update HTML dashboard (if enabled)
             if HTML_OUTPUT_PATH:
                 try:
@@ -1007,6 +1337,17 @@ def main() -> None:
                     # 原有逻辑：只要高于阈值就提醒
                     if remaining > THRESHOLD_YEN:
                         _notify("DuckCoding 额度提醒", f"CodeX 剩余额度：¥{remaining:.2f}，超过阈值 ¥{THRESHOLD_YEN:.2f}")
+                        try:
+                            if EMAIL_ENABLED and (not phase_a_email_sent):
+                                _email_notify(
+                                    "DuckCoding 额度提醒",
+                                    f"CodeX 剩余额度：¥{remaining:.2f}，超过阈值 ¥{THRESHOLD_YEN:.2f}",
+                                    EMAIL_CFG,
+                                    dry_run=bool(EMAIL_DRY_RUN),
+                                )
+                                phase_a_email_sent = True
+                        except Exception:
+                            pass
                         notify_count += 1
                         # 方式二：弹窗次数超上限后，弹一次阻塞框，然后进入阶段B（不再退出）
                         if notify_count >= NOTIFY_LIMIT_BEFORE_BLOCK:
@@ -1036,6 +1377,7 @@ def main() -> None:
                         if (prev > t >= cur) and (t not in fired_thresholds):
                             if not phase_b_first_alert_done:
                                 _notify("DuckCoding 阶段B提醒", f"CodeX 剩余低于 ¥{t:.0f}，当前：¥{cur:.2f}")
+                                # 阶段B不发送邮件；仅在阶段A中一轮只发一次邮件
                                 phase_b_first_alert_done = True
                             # 记录该阈值已触发，避免重复判断
                             fired_thresholds.add(t)
@@ -1049,6 +1391,7 @@ def main() -> None:
                     fired_thresholds.clear()
                     prev_remaining = None
                     phase_b_first_alert_done = False
+                    phase_a_email_sent = False  # 新一轮阶段A允许再次发一封邮件
                     _write_ack_flag(0)  # 重置交互文件为0
                     phase = 'A'
         except Exception as e:
@@ -1066,6 +1409,21 @@ if __name__ == "__main__":
     parser.add_argument("--once", action="store_true", help="Run a single check and exit (will notify if over threshold)")
     parser.add_argument("--force-toast", action="store_true", help="Force using win10toast notifications (may cause console noise on some hosts)")
     parser.add_argument("--html", type=str, help="Write/update a Plotly HTML dashboard at this path (open with VS Code Live Preview/Live Server)")
+    # Email + data options
+    parser.add_argument("--email", action="store_true", help="Enable email notifications via SMTP (see --smtp-* and --email-to)")
+    parser.add_argument("--email-dry-run", action="store_true", help="Do not actually send; print an EMAIL-DRY log instead")
+    parser.add_argument("--email-test", action="store_true", help="Send a one-off test email (requires --email and SMTP config)")
+    parser.add_argument("--email-to", type=str, help="Recipient email(s), comma-separated (default env ALERT_EMAIL_TO or zhiangxu1093@gmail.com)")
+    parser.add_argument("--smtp-user", type=str, help="SMTP username (e.g., your Gmail address)")
+    parser.add_argument("--smtp-pass", type=str, help="SMTP password or App Password")
+    parser.add_argument("--smtp-host", type=str, help="SMTP host (default smtp.gmail.com)")
+    parser.add_argument("--smtp-port", type=str, help="SMTP port (default 587 or 465 for SSL)")
+    parser.add_argument("--smtp-starttls", type=str, help="Use STARTTLS (1/0; default 1 for port 587)")
+    parser.add_argument("--smtp-ssl", type=str, help="Use SSL/TLS (1/0; default 1 for port 465)")
+    parser.add_argument("--smtp-timeout", type=str, help="SMTP timeout seconds (default 18)")
+    parser.add_argument("--smtp-from", type=str, help="From address (default SMTP user)")
+    parser.add_argument("--data-dir", type=str, help="Directory to store persistent history CSV (default: ./data)")
+
     args = parser.parse_args()
 
     # Set runtime toggle for notification backend
@@ -1080,6 +1438,38 @@ if __name__ == "__main__":
         except Exception:
             HTML_OUTPUT_PATH = Path(args.html)
             print(f"[DuckCoding] HTML dashboard enabled: {HTML_OUTPUT_PATH}")
+
+    # Configure data dir
+    try:
+        dd = getattr(args, 'data_dir', None) or os.environ.get('DUCKCODING_DATA_DIR')
+        DATA_DIR_PATH = Path(dd).resolve() if dd else DATA_DIR_DEFAULT
+        print(f"[DuckCoding] Data dir: {DATA_DIR_PATH}")
+    except Exception:
+        DATA_DIR_PATH = DATA_DIR_DEFAULT
+        print(f"[DuckCoding] Data dir: {DATA_DIR_PATH}")
+
+    # Configure email
+    EMAIL_ENABLED = bool(getattr(args, 'email', False))
+    EMAIL_DRY_RUN = bool(getattr(args, 'email_dry_run', False))
+    if EMAIL_ENABLED:
+        try:
+            EMAIL_CFG = _resolve_email_config(args)
+            if EMAIL_CFG is None:
+                print("[DuckCoding] Email enabled but config incomplete; will skip sending")
+        except Exception as e:
+            EMAIL_CFG = None
+            print("[DuckCoding] Email config error:", e)
+
+    # One-off email test
+    if EMAIL_ENABLED and bool(getattr(args, 'email_test', False)):
+        subj = "DuckCoding 测试邮件"
+        body = "这是一封来自 DuckCoding 额度监控的测试邮件。"
+        if EMAIL_CFG is None:
+            print("[DuckCoding] 邮件测试失败：配置不完整")
+            sys.exit(2)
+        ok = _send_email(EMAIL_CFG, subj, body, dry_run=bool(EMAIL_DRY_RUN))
+        print("[DuckCoding] 邮件测试", "成功" if ok else "失败")
+        sys.exit(0)
 
     if args.test_notify:
         _notify("DuckCoding 测试通知", "这是声音与弹窗测试 (带提示音)")
@@ -1137,6 +1527,12 @@ if __name__ == "__main__":
 
             _print_quota_snapshot(details_map, order, stale=stale_map, missing=missing_map)
 
+            # Persist full snapshot to CSV
+            try:
+                _persist_snapshot_csv(DATA_DIR_PATH, order, details_map)
+            except Exception as e:
+                print("[DuckCoding] 历史持久化失败:", e)
+
             # Update HTML once if enabled
             if HTML_OUTPUT_PATH:
                 try:
@@ -1150,6 +1546,16 @@ if __name__ == "__main__":
             decision_ok = _is_plausible_details(details_map.get("CodeX 专用福利", QuotaDetails())) or bool(stale_map.get("CodeX 专用福利"))
             if decision_ok and ack == 0 and remaining > THRESHOLD_YEN:
                 _notify("DuckCoding 额度提醒", f"CodeX 剩余额度：¥{remaining:.2f}，超过阈值 ¥{THRESHOLD_YEN:.2f}")
+                try:
+                    if EMAIL_ENABLED:
+                        _email_notify(
+                            "DuckCoding 额度提醒",
+                            f"CodeX 剩余额度：¥{remaining:.2f}，超过阈值 ¥{THRESHOLD_YEN:.2f}",
+                            EMAIL_CFG,
+                            dry_run=bool(EMAIL_DRY_RUN),
+                        )
+                except Exception:
+                    pass
         except Exception as e:
             print("[DuckCoding] Error:", e)
         sys.exit(0)

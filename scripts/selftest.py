@@ -3,6 +3,7 @@
 
 import importlib.util
 from pathlib import Path
+import os
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -41,6 +42,23 @@ def test_quota():
     qx._print_quota_snapshot(details_map, ['Claude Code 专用福利','CodeX 专用福利','Gemini CLI 专用福利'], stale={'Gemini CLI 专用福利': True}, missing={'Gemini CLI 专用福利': True})
     print('[SELFTEST] quota snapshot ok')
 
+    # Persist snapshot to temp data dir
+    tmp_dir = ROOT / 'data_test_tmp'
+    try:
+        path = qx._persist_snapshot_csv(tmp_dir, ['Claude Code 专用福利','CodeX 专用福利','Gemini CLI 专用福利'], details_map)
+        assert path.exists(), 'history csv not created'
+        content = path.read_text(encoding='utf-8')
+        assert 'ts_iso,ts_epoch' in content.splitlines()[0]
+        print('[SELFTEST] quota persistence ok')
+    finally:
+        # Cleanup
+        try:
+            for p in (tmp_dir.glob('*')):
+                p.unlink()
+            tmp_dir.rmdir()
+        except Exception:
+            pass
+
 
 def test_status():
     p = ROOT / 'duckcoding_status_watcher.py'
@@ -61,7 +79,44 @@ def test_status():
     print('[SELFTEST] status snapshot ok')
 
 
+def test_email_config():
+    # Validate email config resolution from environment vars + dry-run send (no network)
+    qpath = ROOT / 'duckcoding_quota_watcher.py'
+    qx2 = import_module(qpath, 'qx2')
+
+    # Backup and set temporary envs
+    prev = {k: os.environ.get(k) for k in ['SMTP_USER','SMTP_PASS','ALERT_EMAIL_TO']}
+    os.environ['SMTP_USER'] = 'test.sender@gmail.com'
+    os.environ['SMTP_PASS'] = 'app-pass-xxxx'
+    os.environ['ALERT_EMAIL_TO'] = 'zhiangxu1093@gmail.com'
+    try:
+        class Args: pass
+        args = Args()
+        args.email_to = None
+        args.smtp_user = None
+        args.smtp_pass = None
+        args.smtp_host = None
+        args.smtp_port = None
+        args.smtp_starttls = None
+        args.smtp_from = None
+        cfg = qx2._resolve_email_config(args)
+        assert cfg is not None
+        assert cfg.user == 'test.sender@gmail.com'
+        assert 'zhiangxu1093@gmail.com' in cfg.to_addrs
+        ok = qx2._send_email(cfg, '[SELFTEST] DuckCoding 邮件测试(干跑)', '这是一封干跑测试邮件，不会真正发送。', dry_run=True)
+        assert ok
+        print('[SELFTEST] email config ok')
+    finally:
+        # Restore env
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == '__main__':
     test_quota()
     test_status()
+    test_email_config()
     print('[SELFTEST] all passed')

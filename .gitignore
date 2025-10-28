@@ -26,3 +26,8 @@ status_watcher_state.json
 temp1.md
 /temp3.md
 /duckcoding_dashboard.html
+/.vscode
+# Local data and env (untracked)
+/data/
+.env.local
+/.env.local
