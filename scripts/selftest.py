@@ -49,6 +49,11 @@ def test_quota():
         assert path.exists(), 'history csv not created'
         content = path.read_text(encoding='utf-8')
         assert 'ts_iso,ts_epoch' in content.splitlines()[0]
+        # Flat series persistence (3 rows)
+        path2 = qx._persist_benefit_series_csv(tmp_dir, ['Claude Code 专用福利','CodeX 专用福利','Gemini CLI 专用福利'], details_map, stale={'Gemini CLI 专用福利': True})
+        assert path2.exists(), 'series csv not created'
+        head = path2.read_text(encoding='utf-8').splitlines()[0]
+        assert head.startswith('year,month,day,hour,minute,second,curve_id,value,is_cached,is_missing')
         print('[SELFTEST] quota persistence ok')
     finally:
         # Cleanup

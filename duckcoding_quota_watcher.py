@@ -81,6 +81,7 @@ HISTORY_WINDOW_SEC = 12 * 3600
 # Local persistent history storage (untracked)
 DATA_DIR_DEFAULT = Path(__file__).with_name('data')
 HISTORY_FILE_NAME = 'quota_history.csv'
+BENEFIT_SERIES_FILE_NAME = 'benefit_series.csv'
 
 # Email defaults (can be overridden by env or CLI)
 EMAIL_DEFAULT_TO = os.environ.get('ALERT_EMAIL_TO', 'zhiangxu1093@gmail.com')
@@ -1200,6 +1201,87 @@ def _persist_snapshot_csv(data_dir: Path, order: List[str], details_map: Dict[st
     return path
 
 
+def _curve_id_for_label(label: str) -> int:
+    if label == 'Claude Code 专用福利':
+        return 1
+    if label == 'CodeX 专用福利':
+        return 2
+    if label == 'Gemini CLI 专用福利':
+        return 3
+    return 0
+
+
+def _persist_benefit_series_csv(data_dir: Path, order: List[str], details_map: Dict[str, QuotaDetails], stale: Dict[str, bool] | None = None, missing: Dict[str, bool] | None = None, ts: Optional[float] = None) -> Path:
+    """Append 3 rows (one per benefit) into data_dir/benefit_series.csv.
+    Columns: year,month,day,hour,minute,second,curve_id,value,is_cached
+    - value = remaining_yen
+    - is_cached = 1 if value is taken from last-good cache (stale), else 0
+    File is created with header if missing. Never cleared on restart.
+    """
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    path = data_dir / BENEFIT_SERIES_FILE_NAME
+
+    if ts is None:
+        ts = time.time()
+    try:
+        lt = time.localtime(float(ts))
+        y, m, d, hh, mm, ss = lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec
+    except Exception:
+        # Fallback: derive from epoch if localtime fails
+        _ts = int(ts or time.time())
+        y, m, d, hh, mm, ss = 1970, 1, 1, 0, 0, 0
+        try:
+            lt = time.localtime(_ts)
+            y, m, d, hh, mm, ss = lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec
+        except Exception:
+            pass
+
+    header = 'year,month,day,hour,minute,second,curve_id,value,is_cached,is_missing\n'
+
+    try:
+        # Header migration: if file exists and header lacks is_missing, upgrade header and append ,0 for old lines
+        if path.exists():
+            try:
+                with path.open('r', encoding='utf-8', errors='ignore') as rf:
+                    first = rf.readline()
+                if first and 'is_missing' not in first:
+                    tmp = path.with_suffix(path.suffix + '.tmp')
+                    with path.open('r', encoding='utf-8', errors='ignore') as rf, tmp.open('w', encoding='utf-8', newline='') as wf:
+                        old_header = rf.readline().strip()
+                        if old_header:
+                            wf.write(old_header + ',is_missing\n')
+                        else:
+                            wf.write(header)
+                        for line in rf:
+                            line = line.rstrip('\n').rstrip('\r')
+                            if line:
+                                wf.write(line + ',0\n')
+                    os.replace(str(tmp), str(path))
+            except Exception:
+                pass
+
+        new_file = not path.exists()
+        with path.open('a', encoding='utf-8', newline='') as f:
+            if new_file:
+                f.write(header)
+            for label in order:
+                curve = _curve_id_for_label(label)
+                q = details_map.get(label, QuotaDetails())
+                try:
+                    val = float(q.remaining_yen or 0.0)
+                except Exception:
+                    val = 0.0
+                is_cached = 1 if (stale or {}).get(label) else 0
+                is_missing = 1 if (missing or {}).get(label) else 0
+                f.write(f"{y},{m},{d},{hh},{mm},{ss},{curve},{val:.2f},{is_cached},{is_missing}\n")
+    except Exception:
+        pass
+    return path
+
+
 def _print_details(label: str, q: QuotaDetails) -> None:
     # Backward-compat single-line printer (unused in snapshot)
     used_pct_str = f"{q.used_percent:.1f}%" if q.used_percent > 0 else "—"
@@ -1300,6 +1382,7 @@ def main() -> None:
             # Persist full snapshot to CSV (unbounded history)
             try:
                 _persist_snapshot_csv(DATA_DIR_PATH, order, details_map)
+                _persist_benefit_series_csv(DATA_DIR_PATH, order, details_map, stale=stale_map, missing=missing_map)
             except Exception as e:
                 print("[DuckCoding] 历史持久化失败:", e)
 
@@ -1530,6 +1613,7 @@ if __name__ == "__main__":
             # Persist full snapshot to CSV
             try:
                 _persist_snapshot_csv(DATA_DIR_PATH, order, details_map)
+                _persist_benefit_series_csv(DATA_DIR_PATH, order, details_map, stale=stale_map, missing=missing_map)
             except Exception as e:
                 print("[DuckCoding] 历史持久化失败:", e)
 

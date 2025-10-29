@@ -162,9 +162,19 @@ Set-Content -Path duckcoding_ack.txt -Value 0 -NoNewline
 
 ## 数据持久化与仪表盘
 - 历史 CSV：每轮将三令牌快照写入 `data/quota_history.csv`（已忽略，不入库）。可用 `--data-dir` 或 `DUCKCODING_DATA_DIR` 更改目录。
+- 序列 CSV（永久追加，不清空）：每轮为三条曲线各追加一行到 `data/benefit_series.csv`，字段：
+  - `year,month,day,hour,minute,second,curve_id,value,is_cached,is_missing`
+  - `curve_id`: 1=Claude Code 专用福利, 2=CodeX 专用福利, 3=Gemini CLI 专用福利
+  - `value`: 对应福利“剩余额度(¥)”
+  - `is_cached`: 1=使用了“最后一次有效数据”（缓存），0=实时抓取
+  - `is_missing`: 1=本轮该福利无数据（既无实时也无缓存），0=有数据（实时或缓存）
 - HTML 仪表盘：`--html <path>` 开启；单文件内置 Plotly 图表（从 CDN 加载），显示 3 条“剩余额度 (¥)”曲线与最后更新时间。
   - 建议使用 VS Code 的 Live Preview/Live Server 打开该 HTML，脚本写入时页面自动刷新。
   - 默认保留最近约 12 小时数据（源码 `HISTORY_WINDOW_SEC` / `_MAX_HISTORY_POINTS` 可调）。
+
+- 文件对比（两种 CSV 用途）：
+  - `data/quota_history.csv`：宽表，每轮一行，字段包含 `ts_iso, ts_epoch` 与三福利各自的 `total/used/used_percent/remaining`，适合做“完整快照/统计报表”。
+  - `data/benefit_series.csv`：长表，每轮三行，字段 `year,month,day,hour,minute,second,curve_id,value,is_cached,is_missing`，适合做“余额曲线/时间序列分析”。
 
 ## 稳定性说明
 - 额度抓取：优先 UI（Playwright）→ 回退 API → 最后尝试仅抓取“剩余”数字。
