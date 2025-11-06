@@ -496,6 +496,8 @@ def _notify(title: str, msg: str) -> None:
         except Exception:
             return False
 
+    
+
     # Prefer non-blocking Windows toast by default
     _play_sound()
     if not FORCE_MESSAGEBOX and (FORCE_TOAST or USE_TOAST_BY_DEFAULT):
@@ -504,20 +506,52 @@ def _notify(title: str, msg: str) -> None:
             return
         # If toast failed, fall back to MessageBox
 
-    # Fallback: Windows MessageBox (blocking). Keep it visible and foreground.
+            # Fallback: Windows MessageBox (blocking). Keep it visible and foreground.
+            try:
+                MB_OK = 0x00000000
+                MB_ICONINFORMATION = 0x00000040
+                MB_SYSTEMMODAL = 0x00001000
+                MB_SETFOREGROUND = 0x00010000
+                MB_TOPMOST = 0x00040000
+                flags = MB_OK | MB_ICONINFORMATION | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST
+                ctypes.windll.user32.MessageBoxW(0, msg, title, flags)
+            except Exception:
+                try:
+                    ctypes.windll.user32.MessageBoxW(0, msg, title, 0x00000040)
+                except Exception:
+                    pass
+
+
+def _messagebox_nonblocking(title: str, body: str, flags: Optional[int] = None) -> bool:
+    """Show a persistent Windows MessageBox from a child process so main loop continues.
+
+    Default flags: MB_ICONINFORMATION | MB_TOPMOST. Avoid MB_SYSTEMMODAL to prevent system-wide stall.
+    Returns True if child process launched.
+    """
     try:
-        MB_OK = 0x00000000
-        MB_ICONINFORMATION = 0x00000040
-        MB_SYSTEMMODAL = 0x00001000
-        MB_SETFOREGROUND = 0x00010000
-        MB_TOPMOST = 0x00040000
-        flags = MB_OK | MB_ICONINFORMATION | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST
-        ctypes.windll.user32.MessageBoxW(0, msg, title, flags)
-    except Exception:
+        if flags is None:
+            # 0x00000040: MB_ICONINFORMATION, 0x00040000: MB_TOPMOST
+            flags = 0x00000040 | 0x00040000
+        py = sys.executable or 'python'
+        code = (
+            "import ctypes,sys; "
+            "ctypes.windll.user32.MessageBoxW(0, sys.argv[2], sys.argv[1], int(sys.argv[3]))"
+        )
+        creationflags = 0
         try:
-            ctypes.windll.user32.MessageBoxW(0, msg, title, 0x00000040)
+            creationflags = 0x08000000  # CREATE_NO_WINDOW
         except Exception:
-            pass
+            creationflags = 0
+        subprocess.Popen(
+            [py, '-c', code, str(title), str(body), str(int(flags))],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).parent),
+            creationflags=creationflags,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _read_ack_flag() -> int:
@@ -1434,15 +1468,13 @@ def main() -> None:
                         notify_count += 1
                         # 方式二：弹窗次数超上限后，弹一次阻塞框，然后进入阶段B（不再退出）
                         if notify_count >= NOTIFY_LIMIT_BEFORE_BLOCK:
-                            try:
-                                ctypes.windll.user32.MessageBoxW(
-                                    0,
-                                    f"累计提醒已达到 {NOTIFY_LIMIT_BEFORE_BLOCK} 次，将进入阶段B（里程碑提醒）。当前余额：¥{remaining:.2f}",
-                                    "DuckCoding 额度提醒",
-                                    0x00000040,
-                                )
-                            except Exception:
-                                pass
+                            # Show a persistent dialog without blocking the main loop
+                            _messagebox_nonblocking(
+                                "DuckCoding 额度提醒",
+                                f"累计提醒已达到 {NOTIFY_LIMIT_BEFORE_BLOCK} 次，将进入阶段B（里程碑提醒）。当前余额：¥{remaining:.2f}",
+                                # 信息图标 + 置顶，不使用 SYSTEMMODAL 以避免系统级阻塞
+                                flags=(0x00000040 | 0x00040000),
+                            )
                             phase = 'B'
                             fired_thresholds.clear()
                             prev_remaining = remaining
