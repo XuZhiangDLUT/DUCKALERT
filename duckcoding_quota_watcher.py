@@ -66,7 +66,7 @@ API_URL = "https://jp.duckcoding.com/api/usage/token/"
 # Fallback token only used if auto-fetch and env var both fail
 TOKEN_FALLBACK = "sk-123456"
 POLL_INTERVAL_SEC = 60
-THRESHOLD_YEN = 3.0
+THRESHOLD_YEN = 4.99
 # Notification behavior
 NOTIFY_LIMIT_BEFORE_BLOCK = 5  # After this many notifications, show blocking dialog and exit
 SOUND_ALIAS_PRIMARY = "SystemQuestion"  # Less common than SystemNotification
